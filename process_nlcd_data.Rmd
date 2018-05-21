@@ -1,0 +1,283 @@
+---
+title: "NLCD data processing"
+output: html_notebook
+---
+
+
+NLCD data consists of points every 30 metres coded to one of [20 land-cover
+categories](https://www.mrlc.gov/nlcd11_leg.php). This script works by:
+
+  * downloading census block outlines for each state,
+  * counting the number of points of each type in each census block,
+  * merging these counts into a single table for each state,
+  * aggregating these counts for block groups and tracts.
+
+
+# Load packages
+
+All packages needed in this project are loaded here, so that they can be loaded quickly when opening the project.
+
+```{r}
+# raster processing functions
+# note this should be loaded before tidyverse because otherwise raster::select()
+# masks dplyr::select()
+library("raster")
+# data manipulation
+library("tidyverse")
+library("lubridate")
+# downloading files
+library("httr")
+# spatial functions for vector objects that are compatible with raster functions
+library("sp")
+# spatial functions for vector objects that are compatible with tigris
+library("sf")
+# download census outlines
+library("tigris")
+# parellel processing
+library("parallel")
+```
+
+As a first step for increasing the speed of raster calculations, we can [increase
+the memory limit for raster processes](http://www.gis-blog.com/increasing-the-speed-of-raster-processing-with-r-part-13/).
+
+```{r}
+rasterOptions(chunksize = 1e+08, maxmemory = 1e+10)
+```
+
+
+
+# Get NLCD data
+
+[National Land Cover Database](https://www.mrlc.gov/) (NLCD) data are available 
+as a single zipped raster for the whole continental United States. 
+
+```{r}
+# download file
+GET("http://www.landfire.gov/bulk/downloadfile.php?TYPE=nlcd2011&FNAME=nlcd_2011_landcover_2011_edition_2014_10_10.zip", write_disk("original_data/nlcd_data.zip"), progress())
+
+# unzip files on disk
+unzip("original_data/nlcd_data.zip", exdir = "original_data")
+
+# move unzipped files into correct folder
+list.files("original_data/nlcd_2011_landcover_2011_edition_2014_10_10/", 
+           pattern = "\\.", full.names = TRUE, include.dirs = FALSE) %>% 
+  file.copy("original_data")
+  # lapply(function (x) {
+  #   file.rename()
+  # })
+
+# remove directory that is no longer needed
+unlink("original_data/nlcd_2011_landcover_2011_edition_2014_10_10", 
+       recursive = TRUE)
+```
+
+Having downloaded the raster to a file we can now load it. Note that `raster()`
+does not load the entire raster, instead loading parts as needed later on.
+
+```{r}
+# load raster
+nlcd_raster <- raster("original_data/nlcd_2011_landcover_2011_edition_2014_10_10.img")
+```
+
+
+The NLCD categories are:
+
+```{r}
+nlcd_types <- list(
+  "11" = "Open Water",
+  "12" = "Perennial Ice/Snow",
+  "21" = "Developed, Open Space",
+  "22" = "Developed, Low Intensity",
+  "23" = "Developed, Medium Intensity",
+  "24" = "Developed, High Intensity",
+  "31" = "Barren Land (Rock/Sand/Clay)",
+  "41" = "Deciduous Forest",
+  "42" = "Evergreen Forest",
+  "43" = "Mixed Forest",
+  "51" = "Dwarf Scrub",
+  "52" = "Shrub/Scrub",
+  "71" = "Grassland/Herbaceous",
+  "72" = "Sedge/Herbaceous",
+  "73" = "Lichens",
+  "74" = "Moss",
+  "81" = "Pasture/Hay",
+  "82" = "Cultivated Crops",
+  "90" = "Woody Wetlands",
+  "95" = "Emergent Herbaceous Wetlands"
+)
+```
+
+
+# Count NLCD points in each census block
+
+We will use the `tigris` package to get census boundaries and the `getValues()`
+function from the `raster` package to count the number of points in each raster.
+
+State FIPS codes are:
+
+```{r}
+data("fips_codes")
+state_codes <- fips_codes %>% 
+	as_tibble() %>% 
+	rename(code = state_code) %>% 
+	group_by(code) %>% 
+	summarize(name = first(state_name), abbr = first(state)) %>% 
+	filter(as.numeric(code) < 60)
+rm(fips_codes)
+```
+
+`raster` does not yet play very nicely with `sf`, so we need to use `sp` objects
+for the block outlines.
+
+```{r}
+# set cache directory for tigris files
+tigris_cache_dir("original_data")
+readRenviron('~/.Renviron')
+
+# divert output to file on OneDrive
+sink("../../../OneDrive - Nottingham Trent University/Research/NLCD for census geography/output_Ken.txt", 
+		 append = TRUE, split = TRUE)
+
+# list states to be processed
+states_to_process <- c("39", "40", "41", "42", "44", "45", "46", "47")
+
+for (x in states_to_process) {
+	
+	tryCatch({
+		
+		# download state outline (in SF format)
+		print(paste("Downloading outline of state", x))
+		state_outline <- states(class = "sf") %>% 
+			filter(STATEFP == x) %>% 
+			st_transform(proj4string(nlcd_raster)) %>% 
+			as("Spatial")
+		
+		# create a raster for this state
+		print(paste("Creating raster for state", x))
+		state_raster <- crop(nlcd_raster, extent(state_outline))
+		
+		# download census blocks (in SF format)
+		print(paste("Downloading block outlines for state", x))
+		block_outlines <- blocks(state = x) %>% 
+			spTransform(proj4string(nlcd_raster))
+		
+		# count how many blocks in the state
+		blocks_in_state <- nrow(block_outlines)
+		
+	}, 
+	warning = function (w) {
+		print(paste("Warning:", w))
+	},
+	error = function (e) {
+		print(paste("Error:", e))
+		next
+	})
+  
+  # initialise cluster
+  cluster <- makeCluster(detectCores() - 1)
+	
+	# note start time
+	time_start <- Sys.time()
+	
+	# specify variables and libraries that should be available within the parallel lapply loop
+	clusterExport(cluster, c("state_raster", "block_outlines", "blocks_in_state", "time_start"))
+
+	# loop over blocks in the state	
+	print(paste("Processing", format(blocks_in_state, big.mark = ","), 
+							"blocks ..."))
+	block_cell_counts <- tryCatch({
+	  parLapplyLB(cluster, 1:blocks_in_state, function (y) {
+	    
+	  # load packages inside parallel loop
+	  library("raster")
+	  library("tidyverse")
+	  library("lubridate")
+	  library("sp")
+	  library("sf")
+	  library("tigris")
+	       
+	  # get outline of the current block 
+		block_outline <- block_outlines[y, ]
+		
+		# create raster for just cells within current block
+		local_nlcd <- raster::crop(state_raster, raster::extent(block_outline))
+		
+		# extract values from local raster
+		block_cell_count <- raster::rasterize(block_outline, local_nlcd, mask = TRUE) %>%
+			raster::getValues() %>%
+			tibble::as_tibble() %>%
+			dplyr::filter(!is.na(value)) %>%
+			dplyr::group_by(value) %>%
+			dplyr::summarise(count = n()) %>%
+			dplyr::mutate(
+				block = as.character(as.data.frame(block_outlines[y, "GEOID10"]))
+			) %>%
+			dplyr::select(block, value, count)
+		
+		# estimate how long progress will take
+		if (y %in% c(10, 100)) {
+			print(paste(
+				"  after", y, "iterations, it appears processing",
+				format(blocks_in_state, big.mark = ","),
+				"blocks will take approximately another",
+				round(lubridate::seconds_to_period(
+					((as.numeric(Sys.time()) - as.numeric(time_start)) / y) * (blocks_in_state - y)
+				))
+			))
+		}
+
+		# print occasional update
+		if (y %% floor(blocks_in_state / 10) == 0) {
+			print(paste(
+				"  processed", format(y, big.mark = ","), "records -",
+				sprintf("%.0f%%", (y / blocks_in_state) * 100), "of total,",
+				round(lubridate::seconds_to_period(
+					((as.numeric(Sys.time()) - as.numeric(time_start)) / y) * (blocks_in_state - y)
+				)), "to go"
+			))
+		}
+		
+		# return block counts
+		block_cell_count
+		
+	})},
+	error = function (e) {
+		print(paste("Error:", e))
+	})
+	
+	# stop cluster
+	stopCluster(cluster)
+	
+	tryCatch({
+		
+		print(paste("Processed data for state", x, "in", 
+								round(seconds_to_period(
+									as.numeric(Sys.time()) - as.numeric(time_start)
+								))))
+		
+		# combine tibbles
+		print("Combining cell counts")
+		block_cell_counts <- block_cell_counts %>% reduce(rbind)
+		
+		# save state data to a file
+		cat("Saving data to file\n\n")
+		write_csv(block_cell_counts, path = paste0("../../../OneDrive - Nottingham Trent University/Research/NLCD for census geography/state_", x, "_block_counts.csv"), na = "")
+		# saveRDS(block_cell_counts, file = paste0("analysis_data/state_", x, 
+		# 																			"_block_counts.rds"))
+
+		# return block counts
+		block_cell_counts
+		
+	}, 
+	warning = function (w) {
+		print(paste("Warning:", w))
+	},
+	error = function (e) {
+		print(paste("Error:", e))
+		next
+	})
+	
+}
+```
+
+
