@@ -15,7 +15,8 @@ categories](https://www.mrlc.gov/nlcd11_leg.php). This script works by:
 
 # Load packages
 
-All packages needed in this project are loaded here, so that they can be loaded quickly when opening the project.
+All packages needed in this project are loaded here, so that they can be loaded 
+quickly when opening the project.
 
 ```{r}
 # raster processing functions
@@ -36,14 +37,6 @@ library("tigris")
 # parellel processing
 library("parallel")
 ```
-
-As a first step for increasing the speed of raster calculations, we can [increase
-the memory limit for raster processes](http://www.gis-blog.com/increasing-the-speed-of-raster-processing-with-r-part-13/).
-
-```{r}
-rasterOptions(chunksize = 1e+08, maxmemory = 1e+10)
-```
-
 
 
 # Get NLCD data
@@ -124,6 +117,11 @@ state_codes <- fips_codes %>%
 	summarize(name = first(state_name), abbr = first(state)) %>% 
 	filter(as.numeric(code) < 60)
 rm(fips_codes)
+
+# FIPS codes for states to be processed - the 48 contiguous states plus DC
+states_to_process <- state_codes %>% 
+	filter(!name %in% c("Alaska", "Hawaii")) %>% 
+	{ as.character(.$code) }
 ```
 
 `raster` does not yet play very nicely with `sf`, so we need to use `sp` objects
@@ -133,13 +131,6 @@ for the block outlines.
 # set cache directory for tigris files
 tigris_cache_dir("original_data")
 readRenviron('~/.Renviron')
-
-# divert output to file on OneDrive
-sink("../../../OneDrive - Nottingham Trent University/Research/NLCD for census geography/output_Ken.txt", 
-		 append = TRUE, split = TRUE)
-
-# list states to be processed
-states_to_process <- c("39", "40", "41", "42", "44", "45", "46", "47")
 
 for (x in states_to_process) {
 	
@@ -261,9 +252,7 @@ for (x in states_to_process) {
 		
 		# save state data to a file
 		cat("Saving data to file\n\n")
-		write_csv(block_cell_counts, path = paste0("../../../OneDrive - Nottingham Trent University/Research/NLCD for census geography/state_", x, "_block_counts.csv"), na = "")
-		# saveRDS(block_cell_counts, file = paste0("analysis_data/state_", x, 
-		# 																			"_block_counts.rds"))
+		write_csv(block_cell_counts, path = paste0("analysis_data/state_", x, "_block_counts.csv"), na = "")
 
 		# return block counts
 		block_cell_counts
@@ -280,4 +269,155 @@ for (x in states_to_process) {
 }
 ```
 
+
+# Manipulate format of count data
+
+```{r}
+# This function converts counts of raster cells into the proportion of raster
+# cells in each census area that are of a particular type. It expects a tibble
+# with one variable called count_total at at least one other variable with a
+# name starting count_
+count_to_prop <- function (x) {
+	
+	if (!is.tibble(x)) {
+		stop("x must be a tibble")
+	}
+	if (!"count_total" %in% names(x)) {
+		stop("x must include a variable called 'count_total'")
+	}
+	if (sum(str_detect(names(x), "count_")) < 2) {
+		stop("x must contain at least two variables with names beginning 'count_'")
+	}
+
+	x %>% 
+		rename(cell_count = count_total) %>%
+		mutate_at(vars(starts_with("count_")),
+							funs(prop = round(. / cell_count, digits = 4))) %>%
+		rename_at(vars(ends_with("_prop")),
+							funs(paste("prop",
+												 gsub("_", "", str_extract(., "_.+_")),
+												 sep = "_"))) %>%
+		select(-starts_with("count_"))
+
+}
+
+# This function writes a tibble of raster cell counts to a gzipped CSV file,
+# first converting the counts to proportions if required
+write_census_csv <- function(data, state, level, type) {
+	
+	if (!is.tibble(data)) {
+		stop("data must be a tibble")
+	}
+	if (!is.character(state)) {
+		stop("state must be a character")
+	}
+	if (str_length(state) != 2) {
+		stop("state must contain two characters")
+	}
+	if (!is.character(level)) {
+		stop("level must be a character")
+	}
+	if (!level %in% c("block", "blockgroup", "tract")) {
+		stop("level must be one of 'block', 'blockgroup' or 'tract'")
+	}
+	if (!is.character(type)) {
+		stop("type must be a character")
+	}
+	if (!type %in% c("count", "prop")) {
+		stop("level must be one of 'count' or 'prop'")
+	}
+	
+	if (type == "prop") {
+		data <- data %>% count_to_prop()
+	}
+	
+	write.csv(data, file = gzfile(paste0("./analysis_data/nlcd_", level, "_", 
+																			 type, "_", state, ".csv.gz")),
+						row.names = FALSE)
+
+	return(data)
+		
+}
+
+dir("./analysis_data", pattern = "*_block_counts.csv$", full.names = TRUE) %>% 
+	head(1) %>% 
+	map(function (x) {
+		
+		# this code uses base::write.csv() rather than readr::write_csv() because 
+		# there is a bug affecting the writing of some numbers — see
+		# https://github.com/tidyverse/readr/issues/845
+		# a useful side effect of this is that the base function quotes the block
+		# variable, preventing it being parsed as a number when the file is read,
+		# although this does increase the file size
+		
+		# print update
+		print(paste("Started processing file", x, "at", now()))
+		
+		# convert from long to wide, so that each row is a census block, and sum
+		# the number of points in each block
+		block_counts <- read_csv(x, col_types = cols(
+			block = col_character(),
+			.default = col_integer()
+		)) %>% 
+			rename(points = count, count = value) %>% 
+			spread(count, points, sep = "_", fill = 0) %>% 
+			mutate(count_total = select_if(., is.numeric) %>% rowSums())
+		
+		# find state code
+		this_state <- str_sub(block_counts$block[1], 0, 2)
+
+		# create CSVs for blocks
+		block_counts %>%
+			write_census_csv(this_state, "block", "count") %>% 
+			write_census_csv(this_state, "block", "prop")
+			# write.csv(paste0("./analysis_data/nlcd_block_count_", this_state, ".csv"),
+			# 					row.names = FALSE)
+		# block_counts %>%
+		# 	count_to_prop() %>%
+		# 	write.csv(paste0("./analysis_data/nlcd_block_prop_", this_state, ".csv"),
+		# 						row.names = FALSE)
+		
+		# aggregate to block groups
+		bg_counts <- block_counts %>% 
+			mutate(blockgroup = str_sub(block, 0, 12)) %>% 
+			group_by(blockgroup) %>% 
+			summarise_if(is.numeric, sum) %>% 
+			write_census_csv(this_state, "blockgroup", "count") %>% 
+			write_census_csv(this_state, "blockgroup", "prop")
+
+		# create CSVs for block groups
+		# bg_counts %>% 
+		# 	write.csv(paste0("./analysis_data/nlcd_blockgroup_count_", 
+		# 									 this_state, ".csv"),
+		# 						row.names = FALSE)
+		# bg_counts %>% 
+		# 	rename(cell_count = count_total) %>%
+		# 	count_to_prop() %>% 
+		# 	write.csv(paste0("./analysis_data/nlcd_blockgroup_prop_", 
+		# 									 this_state, ".csv"), 
+		# 						row.names = FALSE)
+		
+		# aggregate to tracts
+		tract_counts <- block_counts %>%
+			mutate(tract = str_sub(block, 0, 11)) %>%
+			group_by(tract) %>%
+			summarise_if(is.numeric, sum) %>% 
+			write_census_csv(this_state, "tract", "count") %>% 
+			write_census_csv(this_state, "tract", "prop")
+
+		# create CSVs for tracts
+		# tract_counts %>% 
+		# 	write.csv(paste0("./analysis_data/nlcd_tract_count_", this_state, ".csv"),
+		# 						row.names = FALSE)
+		# tract_counts %>% 
+		# 	rename(cell_count = count_total) %>%
+		# 	count_to_prop() %>% 
+		# 	write.csv(paste0("./analysis_data/nlcd_tract_prop_", this_state, ".csv"), 
+		# 						row.names = FALSE)
+						
+		# don't return the huge data frame
+		FALSE
+
+	}) %>% invisible()
+```
 
